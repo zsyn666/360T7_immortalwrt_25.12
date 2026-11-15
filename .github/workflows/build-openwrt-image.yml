@@ -1,20 +1,16 @@
 name: Build OpenWrt Image (qihoo_360t7)
 
 # 只构建 qihoo_360t7，基于 ImmortalWrt 25.12.2 官方 ImageBuilder。
-# 支持两种 flash 布局：ubi（qihoo_360t7-ubi，供已改 UBI 布局的设备）/ non-ubi（原厂布局）。
+# 一次运行同时产出两种 flash 布局（non-ubi 原厂 / ubi 第三方 UBI U-Boot），
+# 全部发布到同一个 Release，通过文件名区分。
+#
+# 默认 LuCI 主题为 7Dollar：构建时从上游仓库拉取最新 apk 注入 ImageBuilder，
+# 不把第三方二进制文件固化进本仓库。
 # 不编译任何第三方插件：25.12 起包格式为 .apk，旧 ipk 插件链已全部移除。
 
 on:
   workflow_dispatch:
     inputs:
-      layout:
-        type: choice
-        description: "Flash 布局（360T7 刷过第三方 UBI U-Boot 的选 UBI）"
-        required: true
-        default: ubi
-        options:
-          - ubi
-          - non-ubi
       ip_address:
         type: string
         description: "后台 IP 地址（可选，默认 192.168.10.1）"
@@ -25,6 +21,7 @@ on:
 env:
   TZ: Asia/Shanghai
   DEVICE: qihoo_360t7
+  THEME_REPO: itsmaiGe/luci-theme-7dollar
 
 permissions:
   contents: write
@@ -55,25 +52,15 @@ jobs:
         id: device-config
         run: |
           DEVICE="${{ env.DEVICE }}"
-          # 定时触发没有 inputs，默认走 UBI 布局（当前设备所用布局）
-          LAYOUT="${{ github.event.inputs.layout || 'ubi' }}"
-          case "$LAYOUT" in
-            ubi)      CONFIG_FILE="build/${DEVICE}/config_ubi.sh" ;;
-            non-ubi)  CONFIG_FILE="build/${DEVICE}/config.sh" ;;
-            *) echo "::error::Unknown layout: $LAYOUT"; exit 1 ;;
-          esac
-
-          echo "layout=$LAYOUT" >> $GITHUB_OUTPUT
-          echo "::notice::Layout: $LAYOUT -> $CONFIG_FILE"
-
+          # 两个布局共用一份 ImageBuilder，公共参数取自非 UBI 的基准配置
+          CONFIG_FILE="build/${DEVICE}/config.sh"
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "::error::Config file not found: $CONFIG_FILE"
             exit 1
           fi
-
           source "$CONFIG_FILE"
 
-          INPUT_IP="${{ github.event.inputs.ip_address }}"
+          INPUT_IP="${{ github.event.inputs.ip_address || '' }}"
           if [ -n "$INPUT_IP" ]; then
             ip_address="$INPUT_IP"
           fi
@@ -88,7 +75,7 @@ jobs:
           echo "major_version=$(echo "$version" | cut -d. -f1,2)" >> $GITHUB_OUTPUT
           echo "sanitized_target=${targets//\//-}" >> $GITHUB_OUTPUT
 
-          echo "::notice::Device: $profile, Target: $targets, Version: $version"
+          echo "::notice::Device: $DEVICE, Target: $targets, Version: $version, IP: $ip_address"
 
       - name: 📥 Download ImageBuilder sha256sums
         id: imagebuilder-sha256
@@ -166,6 +153,49 @@ jobs:
           fi
           echo "✅ ImageBuilder extracted successfully"
 
+      - name: 🎨 Fetch 7Dollar Theme (latest apk from upstream)
+        id: theme
+        run: |
+          REPO="${{ env.THEME_REPO }}"
+          RAW="https://raw.githubusercontent.com/${REPO}/main"
+
+          # 清掉缓存中可能残留的旧版主题包与索引，避免 apk mkndx 索引到多个版本
+          mkdir -p imagebuilder/packages
+          rm -f imagebuilder/packages/*.apk imagebuilder/packages/packages.adb
+
+          # 上游用 dist/latest-apk.txt 标记 25.x 适用的 apk 文件名
+          curl -fsSL --retry 3 "${RAW}/dist/latest-apk.txt" -o /tmp/7dollar-latest.txt
+          PKG=$(head -n1 /tmp/7dollar-latest.txt | tr -d '\r\n ')
+          VER=$(echo "$PKG" | sed -n 's/^luci-theme-7dollar[_-]\([0-9.]*\)-r.*/\1/p')
+
+          if [ -z "$PKG" ] || [ -z "$VER" ]; then
+            echo "::error::Cannot resolve theme apk/version from latest-apk.txt: $(cat /tmp/7dollar-latest.txt)"
+            exit 1
+          fi
+
+          mkdir -p imagebuilder/packages
+          URL="https://github.com/${REPO}/releases/download/v${VER}/${PKG}"
+          echo "⬇️ $URL"
+          if ! curl -fsSL --retry 3 -o "imagebuilder/packages/${PKG}" "$URL"; then
+            echo "⚠️ Release 下载失败，回退到仓库内 dist/"
+            curl -fsSL --retry 3 -o "imagebuilder/packages/${PKG}" "${RAW}/dist/${PKG}"
+          fi
+
+          if [ ! -s "imagebuilder/packages/${PKG}" ]; then
+            echo "::error::Theme apk is empty or missing"
+            exit 1
+          fi
+
+          # ImageBuilder 若启用签名校验，未签名的第三方 apk 会被拒，这里直接关闭
+          if [ -f imagebuilder/.config ]; then
+            sed -i 's/^CONFIG_SIGNATURE_CHECK=y/# CONFIG_SIGNATURE_CHECK is not set/' imagebuilder/.config
+          fi
+
+          echo "sha256=$(sha256sum "imagebuilder/packages/${PKG}" | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "pkg=$PKG" >> $GITHUB_OUTPUT
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "::notice::7Dollar theme ${PKG} ($(stat -c%s "imagebuilder/packages/${PKG}") bytes) injected into imagebuilder/packages/"
+
       - name: 📝 Prepare Packages
         id: packages
         run: |
@@ -174,7 +204,7 @@ jobs:
 
           # 全局包（当前为空，25.12 官方默认包已包含全部基础上网功能）
           source "config/default_packages.sh"
-          # 设备级包（仅显式锁定官方精简主题 luci-theme-bootstrap）
+          # 设备级包：官方精简主题 + 7Dollar（由 Fetch 步骤注入 packages/）
           source "build/${DEVICE}/packages.sh"
 
           echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
@@ -203,48 +233,92 @@ jobs:
 
           echo "✅ Custom script patched: ${HOSTNAME} / ${IP_ADDRESS} / ${NETMASK}"
 
-      - name: 🔨 Build Firmware
+      - name: 🔨 Build Firmware (non-ubi + ubi)
         run: |
-          PROFILE="${{ steps.device-config.outputs.profile }}"
+          set -euo pipefail
+          DEVICE="${{ env.DEVICE }}"
           PACKAGES="${{ steps.packages.outputs.packages }}"
-
-          cd imagebuilder
-          echo "🚀 PROFILE=$PROFILE"
-          echo "📦 PACKAGES=$PACKAGES"
-          echo "🔄 Jobs: $(nproc)"
-
-          if ! make -j$(nproc) image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="files/" V=s; then
-            echo "::error::Build failed"
-            [ -d logs ] && grep -i 'error\|failed' logs/*.log | head -20 || true
-            exit 1
-          fi
-          echo "✅ Build completed successfully"
-
-      - name: 🗜️ Archive Artifacts
-        run: |
-          PROFILE="${{ steps.device-config.outputs.profile }}"
-          ARTIFACT_DIR="artifacts/${PROFILE}"
           ARCH_SEGMENT="${{ steps.device-config.outputs.sanitized_target }}-"
+          ROOT="$GITHUB_WORKSPACE"
 
-          mkdir -p "$ARTIFACT_DIR"
-          mapfile -t FIRMWARE_FILES < <(find imagebuilder/bin/targets -type f \( \
-            -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" \
-            -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \))
+          for LAYOUT in non-ubi ubi; do
+            case "$LAYOUT" in
+              non-ubi) CFG="${ROOT}/build/${DEVICE}/config.sh" ;;
+              ubi)     CFG="${ROOT}/build/${DEVICE}/config_ubi.sh" ;;
+            esac
 
-          if [ "${#FIRMWARE_FILES[@]}" -eq 0 ]; then
-            echo "::error::No firmware artifacts found under imagebuilder/bin/targets"
-            find imagebuilder/bin/targets -maxdepth 4 -type d -print || true
-            exit 1
-          fi
+            # 每个布局读自己的 profile；其余公共参数两份配置一致
+            if [ ! -f "$CFG" ]; then
+              echo "::error::Config not found: $CFG"
+              exit 1
+            fi
+            unset profile
+            # shellcheck disable=SC1090
+            source "$CFG"
+            PROFILE="$profile"
+            if [ -z "$PROFILE" ]; then
+              echo "::error::profile is empty in $CFG"
+              exit 1
+            fi
 
-          for file in "${FIRMWARE_FILES[@]}"; do
-            filename="$(basename "$file")"
-            cleaned_name="${filename#immortalwrt-}"
-            cleaned_name="${cleaned_name//${ARCH_SEGMENT}/}"
-            cp "$file" "$ARTIFACT_DIR/$cleaned_name"
-            echo "📦 $filename -> $cleaned_name"
+            echo "::group::🔨 Build ${LAYOUT} -> ${PROFILE}"
+            cd "${ROOT}/imagebuilder"
+            echo "🚀 PROFILE=$PROFILE"
+            echo "📦 PACKAGES=$PACKAGES"
+            echo "🔄 Jobs: $(nproc)"
+            if ! make -j$(nproc) image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="files/" V=s; then
+              echo "::error::Build failed for $PROFILE"
+              [ -d logs ] && grep -i 'error\|failed' logs/*.log | head -20 || true
+              exit 1
+            fi
+            cd "$ROOT"
+
+            # 归档该布局的产物到独立目录，文件名去掉 immortalwrt- 前缀与架构段
+            ART="${ROOT}/artifacts/${PROFILE}"
+            mkdir -p "$ART"
+            mapfile -t FIRMWARE_FILES < <(find "${ROOT}/imagebuilder/bin/targets" -type f \( \
+              -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" \
+              -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \))
+
+            if [ "${#FIRMWARE_FILES[@]}" -eq 0 ]; then
+              echo "::error::No firmware artifacts found for $PROFILE"
+              exit 1
+            fi
+
+            for file in "${FIRMWARE_FILES[@]}"; do
+              filename="$(basename "$file")"
+              cleaned_name="${filename#immortalwrt-}"
+              cleaned_name="${cleaned_name//${ARCH_SEGMENT}/}"
+              # sha256sums 两个布局同名，发布到同一 Release 会互相覆盖，加 profile 后缀
+              if [ "$filename" = "sha256sums" ]; then
+                cleaned_name="sha256sums-${PROFILE}"
+              fi
+              cp "$file" "$ART/$cleaned_name"
+              echo "📦 $filename -> $ART/$cleaned_name"
+            done
+            echo "✅ Archived ${#FIRMWARE_FILES[@]} files for $PROFILE"
+
+            # 核心校验：确认 7Dollar 真的装进了固件，而不是被 apk 静默跳过
+            MANIFEST=$(find "${ROOT}/imagebuilder/bin/targets" -type f -name '*.manifest' | head -n1)
+            if [ -z "$MANIFEST" ]; then
+              echo "::error::No .manifest produced for $PROFILE"
+              exit 1
+            fi
+            if ! grep -qE '^luci-theme-7dollar([ -=]|$)' "$MANIFEST"; then
+              echo "::error::7Dollar theme missing from $PROFILE manifest!"
+              echo "--- manifest head ---"
+              head -20 "$MANIFEST"
+              exit 1
+            fi
+            echo "✅ 7Dollar confirmed in $PROFILE manifest: $(grep -E '^luci-theme-7dollar([ -=]|$)' "$MANIFEST")"
+
+            # 清空本次产物，避免下一次 make image 的 sha256sums 混入其它布局
+            rm -f "${FIRMWARE_FILES[@]}"
+            echo "::endgroup::"
           done
-          echo "✅ Archived ${#FIRMWARE_FILES[@]} files"
+
+          echo "::notice::Both layouts built. Artifact tree:"
+          find artifacts -type f | sort
 
       - name: 🧹 Clean Firmware Before Cache
         if: always()
@@ -260,29 +334,33 @@ jobs:
       - name: 🗑️ Delete Old Release & Tag
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           RELEASE_TAG="${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}"
-          echo "🔍 Checking for existing release: $RELEASE_TAG"
+          # 历史上 UBI 曾单独发一个 -ubi 结尾的 Release，一并清理，避免遗留
+          for TAG in "$RELEASE_TAG" "${RELEASE_TAG}-ubi"; do
+            echo "🔍 Checking for existing release: $TAG"
+            if gh release view "$TAG" --repo "$GH_REPO" &>/dev/null; then
+              echo "🗑️ Deleting old release: $TAG"
+              gh release delete "$TAG" --repo "$GH_REPO" --yes
+            else
+              echo "ℹ️ No existing release found: $TAG"
+            fi
 
-          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            echo "🗑️ Deleting old release: $RELEASE_TAG"
-            gh release delete "$RELEASE_TAG" --repo "${{ github.repository }}" --yes
-          else
-            echo "ℹ️ No existing release found"
-          fi
-
-          if git rev-parse "$RELEASE_TAG" &>/dev/null; then
-            git tag -d "$RELEASE_TAG" || true
-            git push --delete origin "$RELEASE_TAG" 2>/dev/null || echo "⚠️ Remote tag not deleted (may not exist)"
-          fi
+            if git rev-parse "$TAG" &>/dev/null; then
+              git tag -d "$TAG" || true
+            fi
+          done
 
       - name: 🚀 Upload to Release
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          files: artifacts/${{ steps.device-config.outputs.profile }}/*
+          files: |
+            artifacts/${{ env.DEVICE }}/*
+            artifacts/${{ env.DEVICE }}-ubi/*
           tag_name: ${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}
-          name: 📤 ${{ steps.device-config.outputs.version }} ${{ steps.device-config.outputs.profile }}
+          name: 📤 ${{ steps.device-config.outputs.version }} ${{ env.DEVICE }}（UBI + 非 UBI）
           body: |
             ### 📋 Build Information
 
@@ -290,14 +368,25 @@ jobs:
             **Build Date**: `${{ steps.get-date.outputs.date }}`
             **Source**: `immortalwrt/immortalwrt @ openwrt-25.12`
 
+            ### 🎨 LuCI 主题
+
+            默认主题 [7Dollar](https://github.com/${{ env.THEME_REPO }}) `${{ steps.theme.outputs.ver }}`，构建时从上游最新 Release 拉取 apk 注入 ImageBuilder，未固化在本仓库。
+
+            ### 📦 本 Release 同时包含两种 Flash 布局
+
+            | 布局 | Profile | 适用设备 | 文件名特征 |
+            | --- | --- | --- | --- |
+            | 非 UBI | `${{ env.DEVICE }}` | 原厂分区表 / 原厂 U-Boot | `25.12.2-qihoo_360t7-*` |
+            | UBI | `${{ env.DEVICE }}-ubi` | 已刷第三方 UBI 布局 U-Boot | `25.12.2-qihoo_360t7-ubi-*` |
+
+            请按自己设备的分区布局选择，刷错会无法启动。
+
             ### 🔧 Firmware Information
 
-            **Profile**: `${{ steps.device-config.outputs.profile }}`
-            **Layout**: `${{ steps.device-config.outputs.layout }}`
             **Architecture**: `${{ steps.device-config.outputs.arch }}`
             **Target**: `${{ steps.device-config.outputs.targets }}`
             **ImageBuilder Version**: `${{ steps.device-config.outputs.version }}`
             **IP Address**: `${{ steps.device-config.outputs.ip_address }}`
-            **Packages**: `${{ steps.packages.outputs.packages }}`（官方默认包，无第三方插件）
+            **Packages**: `${{ steps.packages.outputs.packages }}`（官方默认包，无第三方插件，仅额外集成 7Dollar 主题）
           draft: false
           prerelease: false

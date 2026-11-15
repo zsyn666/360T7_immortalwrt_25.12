@@ -2,7 +2,7 @@
 
 基于 GitHub Actions + ImmortalWrt 官方 ImageBuilder 的自动化固件构建仓库。
 
-**只构建 `qihoo_360t7`（360 T7）一台设备，只保留官方默认包 + 官方精简主题，不编译、不安装任何第三方插件。**
+**只构建 `qihoo_360t7`（360 T7）一台设备，只保留官方默认包 + LuCI 主题，不编译、不安装任何第三方插件。**
 
 基础版本：ImmortalWrt **25.12.2**（对应源码分支 [`immortalwrt/immortalwrt @ openwrt-25.12`](https://github.com/immortalwrt/immortalwrt/tree/openwrt-25.12)）。
 
@@ -10,17 +10,45 @@
 
 ---
 
+## 一次构建，两种布局同一个 Release
+
+**每次运行同时产出 `qihoo_360t7`（非 UBI / 原厂分区）和 `qihoo_360t7-ubi`（UBI 分区）两套固件，一起发布到同一个 Release。**
+
+两个 profile 都存在于同一份 ImageBuilder 的 `profiles.json` 里，所以工作流只下载、解压一次 ImageBuilder，顺序跑两次 `make image`（`_call_image` 每次都会重建 `TARGET_DIR`，天然隔离）。产物文件名自带 profile 名，不会混淆；`sha256sums` 会加 `-<profile>` 后缀避免同名覆盖。
+
+| 布局 | Profile | 适用设备 | 文件名特征 |
+| --- | --- | --- | --- |
+| 非 UBI | `qihoo_360t7` | 原厂分区表 / 原厂 U-Boot | `25.12.2-qihoo_360t7-*` |
+| UBI | `qihoo_360t7-ubi` | 已刷第三方 UBI 布局 U-Boot | `25.12.2-qihoo_360t7-ubi-*` |
+
+刷机前请按自己设备的分区布局选择，刷错会无法启动。
+
+Release Tag：`25.12-qihoo_360t7`（唯一一个，不再单独发布 `-ubi` 结尾的 Release）。
+
+## LuCI 默认主题：7Dollar
+
+默认主题为 [7Dollar](https://github.com/itsmaiGe/luci-theme-7dollar)，**构建时从上游拉取最新版 apk，不把第三方二进制文件固化进本仓库**：
+
+1. 工作流读取上游 `dist/latest-apk.txt` 得到当前 25.x 适用的 apk 文件名与版本
+2. 从该版本的 GitHub Release（失败则回退仓库内 `dist/`）下载到 `imagebuilder/packages/`
+3. ImageBuilder 会自动 `apk mkndx` 生成索引，并通过 `--repository packages.adb` 纳入安装源
+4. `PACKAGES` 里追加 `luci-theme-7dollar`，`make image` 时装进固件
+5. ImageBuilder 以 `--no-scripts` 装包，主题自带的 post-install 不会执行，因此 `99-custom.sh` 在首次启动时显式 `uci set luci.main.mediaurlbase='/luci-static/7dollar'`
+
+官方 `luci-theme-bootstrap` 仍然保留，可在 **系统 → 系统 → 语言和界面 → 主题** 随时切回。
+
 ## 仓库结构
 
 ```text
 OpenWrt-Actions/
 ├─ .github/workflows/
-│  └─ build-openwrt-image.yml          # 唯一的工作流：下载 ImageBuilder → 打包 → 发布 Release
+│  └─ build-openwrt-image.yml          # 唯一的工作流：下载 ImageBuilder → 拉 7Dollar → 双布局打包 → 同一 Release
 ├─ build/
 │  └─ qihoo_360t7/                     # 唯一的设备目录
-│     ├─ config.sh                     # 设备核心参数（profile / target / 版本 / IP）
-│     ├─ packages.sh                   # 设备级包（仅官方 luci-theme-bootstrap）
-│     └─ 99-custom.sh                  # 首次启动脚本（主机名 / LAN IP / 作者信息）
+│     ├─ config.sh                     # 非 UBI 配置（也是公共参数基准）
+│     ├─ config_ubi.sh                 # UBI 布局配置（仅 profile / layout 不同）
+│     ├─ packages.sh                   # 设备级包（bootstrap + 7Dollar）
+│     └─ 99-custom.sh                  # 首次启动脚本（主机名 / LAN IP / 主题 / 作者信息）
 └─ config/
    └─ default_packages.sh               # 全局包（留空，使用官方默认包）
 ```
@@ -52,27 +80,28 @@ LuCI 里那个 **Turbo ACC 网络加速设置页是第三方 `luci-app-turboacc`
 - 主机名：`360T7`
 - LAN 管理地址：`192.168.10.1` / `255.255.255.0`（可在 Actions 手动触发时用 `ip_address` 覆盖）
 - SSH 允许所有网口连接
-- LuCI 主题固定为官方精简主题 `bootstrap`
+- LuCI 默认主题：`7Dollar`（可切回 `bootstrap`）
 - `/etc/openwrt_release` 的 `DISTRIB_DESCRIPTION` 写为 `By zsyn666`
 
 ## 构建流程
 
 工作流：`.github/workflows/build-openwrt-image.yml`（单 job）
 
-1. 读取 `build/qihoo_360t7/config.sh`
+1. 读取 `build/qihoo_360t7/config.sh` 的公共参数
 2. 从 `https://downloads.immortalwrt.org/releases/25.12.2/targets/mediatek/filogic/` 下载官方 ImageBuilder，并用 `sha256sums` 校验
 3. 缓存 ImageBuilder（`actions/cache`，key 含版本号与 sha256）
-4. 合并包列表：`config/default_packages.sh`（空）→ `build/qihoo_360t7/packages.sh`（`luci-theme-bootstrap`）
-5. 复制并注入 `99-custom.sh`
-6. `make -j$(nproc) image PROFILE="qihoo_360t7" PACKAGES="luci-theme-bootstrap" FILES="files/" V=s`
-7. 收集固件到 `artifacts/qihoo_360t7/`，删除同名旧 Release / Tag，发布到新 Release
-
-Release Tag：`25.12-qihoo_360t7`
+4. 从 7Dollar 上游拉最新 apk 到 `imagebuilder/packages/`
+5. 合并包列表：`config/default_packages.sh`（空）→ `build/qihoo_360t7/packages.sh`
+6. 复制并注入 `99-custom.sh`
+7. **依次** `make -j$(nproc) image PROFILE="qihoo_360t7" ...` 与 `PROFILE="qihoo_360t7-ubi" ...`，每次归档后清空产物
+8. 删除同名旧 Release / Tag（含历史的 `-ubi` 结尾 Release），发布两套固件到同一个 Release
 
 ### 触发方式
 
 - **手动**：Actions → `Build OpenWrt Image (qihoo_360t7)` → Run workflow，可选填后台 IP
 - **定时**：每周五 UTC 00:00（北京时间周五 08:00）
+
+手动触发时不再需要选布局，两种布局每次都一起产出。
 
 ### 产物命名
 
@@ -83,18 +112,23 @@ Release Tag：`25.12-qihoo_360t7`
 25.12.2-qihoo_360t7-initramfs-recovery.itb
 25.12.2-qihoo_360t7-bl31-uboot.fip
 25.12.2-qihoo_360t7-preloader.bin
+25.12.2-qihoo_360t7-ubi-squashfs-sysupgrade.itb
+25.12.2-qihoo_360t7-ubi-initramfs-recovery.itb
+...
+sha256sums-qihoo_360t7
+sha256sums-qihoo_360t7-ubi
 ```
 
 ## 如何改版本
 
-编辑 `build/qihoo_360t7/config.sh` 的 `version`，例如改成 `25.12.3`。需确认上游存在对应的 ImageBuilder 文件：
+编辑 `build/qihoo_360t7/config.sh` 与 `config_ubi.sh` 的 `version`（两处保持一致），例如改成 `25.12.3`。需确认上游存在对应的 ImageBuilder 文件：
 
 ```text
 https://downloads.immortalwrt.org/releases/<version>/targets/mediatek/filogic/
   immortalwrt-imagebuilder-<version>-mediatek-filogic.Linux-x86_64.tar.zst
 ```
 
-`profile` 名称可用 ImageBuilder 里的 `make info` 或上游 `profiles.json` 核对，当前为 `qihoo_360t7`（另有 UBI 版 `qihoo_360t7-ubi`，按需切换）。
+`profile` 名称可用 ImageBuilder 里的 `make info` 或上游 `profiles.json` 核对，当前为 `qihoo_360t7` 与 `qihoo_360t7-ubi`。
 
 ## 如何加回官方包
 
@@ -110,9 +144,11 @@ PACKAGES="$PACKAGES iperf3"
 
 | 现象 | 排查 |
 | --- | --- |
-| ImageBuilder 下载 404 | `config.sh` 的 `version` 与上游发布版本号不一致 |
+| ImageBuilder 下载 404 | `config.sh` / `config_ubi.sh` 的 `version` 与上游发布版本号不一致 |
 | `sha256sum -c` 失败 | 上游 `sha256sums` 更新，清掉 Actions 缓存后重试 |
 | 构建报 PROFILE 不存在 | 用 `make info` 核对 `profile`，注意 360T7 有 `qihoo_360t7` 与 `qihoo_360t7-ubi` 两个 |
+| 主题还是 Bootstrap | `99-custom.sh` 的 `mediaurlbase` 未生效，或主题 apk 未装进固件，看构建日志的 `Installing packages...` |
+| 7Dollar apk 下载失败 | 上游 Release 无对应 tag，工作流会自动回退到仓库内 `dist/`；若两者都失败检查 `latest-apk.txt` |
 | 找不到 Turbo ACC 菜单 | 符合预期，见上文「关于 Turbo ACC 网络加速」 |
 
 ## 免责声明

@@ -14,8 +14,10 @@ uci set network.lan.ipaddr="$ip_address"
 uci set network.lan.netmask="$netmask"
 # 允许所有网口连接 SSH
 uci set dropbear.@dropbear[0].Interface=''
-# 固定使用官方精简主题
-uci set luci.main.mediaurlbase='/luci-static/bootstrap'
+# 默认主题 7Dollar（构建时由工作流注入其 apk；ImageBuilder 以 --no-scripts 装包，
+# 主题自带的 post-install 不会执行，故此处必须显式设置）
+# 保留 bootstrap 作为可回退主题：系统 → 系统 → 语言和界面 → 主题
+uci set luci.main.mediaurlbase='/luci-static/7dollar'
 uci commit
 
 # 编译作者信息：写入 /etc/openwrt_release 的 DISTRIB_DESCRIPTION
