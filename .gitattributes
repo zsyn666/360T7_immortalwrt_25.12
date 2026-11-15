@@ -1,0 +1,13 @@
+# 强制所有会被 Linux/路由器执行的文本使用 LF 换行。
+# 该仓库 core.autocrlf=true（Windows），若无此文件，checkout 时
+# 99-custom.sh / config.sh 会被转成 CRLF，导致固件内脚本执行失败、
+# source 出的变量尾部带 \r（拼 ImageBuilder URL 会出错）。
+
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+README.md text eol=lf

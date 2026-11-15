@@ -1,0 +1,284 @@
+name: Build OpenWrt Image (qihoo_360t7)
+
+# 只构建 qihoo_360t7，基于 ImmortalWrt 25.12.2 官方 ImageBuilder。
+# 不编译任何第三方插件：25.12 起包格式为 .apk，旧 ipk 插件链已全部移除。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ip_address:
+        type: string
+        description: "后台 IP 地址（可选，默认 192.168.10.1）"
+        required: false
+  schedule:
+    - cron: '0 0 * * 5'
+
+env:
+  TZ: Asia/Shanghai
+  DEVICE: qihoo_360t7
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🛬 Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 📅 Get Build Date (CST)
+        id: get-date
+        run: |
+          echo "date=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_OUTPUT
+
+      - name: 🔧 Setup Build Environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev \
+            xsltproc wget curl unzip zstd xz-utils file jq axel coreutils openssl \
+            python3 rsync findutils
+
+      - name: 📖 Read Device Configuration
+        id: device-config
+        run: |
+          DEVICE="${{ env.DEVICE }}"
+          CONFIG_FILE="build/${DEVICE}/config.sh"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::Config file not found: $CONFIG_FILE"
+            exit 1
+          fi
+
+          source "$CONFIG_FILE"
+
+          INPUT_IP="${{ github.event.inputs.ip_address }}"
+          if [ -n "$INPUT_IP" ]; then
+            ip_address="$INPUT_IP"
+          fi
+
+          echo "hostname=$hostname"       >> $GITHUB_OUTPUT
+          echo "profile=$profile"         >> $GITHUB_OUTPUT
+          echo "targets=$targets"         >> $GITHUB_OUTPUT
+          echo "arch=$arch"               >> $GITHUB_OUTPUT
+          echo "version=$version"         >> $GITHUB_OUTPUT
+          echo "ip_address=$ip_address"   >> $GITHUB_OUTPUT
+          echo "netmask=$netmask"         >> $GITHUB_OUTPUT
+          echo "major_version=$(echo "$version" | cut -d. -f1,2)" >> $GITHUB_OUTPUT
+          echo "sanitized_target=${targets//\//-}" >> $GITHUB_OUTPUT
+
+          echo "::notice::Device: $profile, Target: $targets, Version: $version"
+
+      - name: 📥 Download ImageBuilder sha256sums
+        id: imagebuilder-sha256
+        run: |
+          VERSION="${{ steps.device-config.outputs.version }}"
+          TARGETS="${{ steps.device-config.outputs.targets }}"
+          BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${TARGETS}"
+
+          curl -fsSL "${BASE_URL}/sha256sums" -o /tmp/sha256sums
+
+          IB_FILE="immortalwrt-imagebuilder-${VERSION}-${{ steps.device-config.outputs.sanitized_target }}.Linux-x86_64.tar.zst"
+          IB_HASH=$(grep -F " *${IB_FILE}" /tmp/sha256sums | head -n1 | awk '{print $1}')
+
+          if [ -z "$IB_HASH" ]; then
+            echo "::error::Failed to find ImageBuilder hash for $IB_FILE"
+            exit 1
+          fi
+
+          echo "ib_file=$IB_FILE" >> $GITHUB_OUTPUT
+          echo "ib_hash=$IB_HASH" >> $GITHUB_OUTPUT
+          echo "✅ ImageBuilder sha256: $IB_HASH"
+
+      - name: 💾 Restore ImageBuilder Cache
+        id: cache-restore
+        uses: actions/cache@v5
+        with:
+          path: imagebuilder
+          key: imagebuilder-${{ steps.device-config.outputs.version }}-${{ steps.device-config.outputs.sanitized_target }}-${{ steps.imagebuilder-sha256.outputs.ib_hash }}
+
+      - name: 📦 Download ImageBuilder
+        id: download
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          VERSION="${{ steps.device-config.outputs.version }}"
+          TARGETS="${{ steps.device-config.outputs.targets }}"
+          IB_FILE="${{ steps.imagebuilder-sha256.outputs.ib_file }}"
+          BASE_URL="https://downloads.immortalwrt.org/releases/${VERSION}/targets/${TARGETS}"
+
+          mkdir -p imagebuilder_tmp
+          echo "🚀 Downloading ${BASE_URL}/${IB_FILE}"
+          axel -n 16 -o "imagebuilder_tmp/${IB_FILE}" "${BASE_URL}/${IB_FILE}" \
+            || curl -fL --retry 3 -o "imagebuilder_tmp/${IB_FILE}" "${BASE_URL}/${IB_FILE}"
+
+          # 校验下载完整性（sha256sums 里是 " *文件名" 格式，需去掉 " *"）
+          grep -F " *${IB_FILE}" /tmp/sha256sums | sed 's/ \*/  /' > /tmp/ib.sha256
+          (cd imagebuilder_tmp && sha256sum -c /tmp/ib.sha256)
+
+      - name: 📦 Extract ImageBuilder
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          IB_FILE="${{ steps.imagebuilder-sha256.outputs.ib_file }}"
+          ARCHIVE="imagebuilder_tmp/${IB_FILE}"
+
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "::error::Archive not found: $ARCHIVE"
+            exit 1
+          fi
+
+          mkdir -p extract_tmp
+          cd extract_tmp
+          tar -I zstd -xf "$OLDPWD/$ARCHIVE"
+
+          IB_DIR=$(find . -mindepth 1 -maxdepth 1 -type d -name 'immortalwrt-imagebuilder-*' | head -n1)
+          if [ -z "$IB_DIR" ]; then
+            echo "::error::ImageBuilder directory not found after extraction"
+            exit 1
+          fi
+          mv "$IB_DIR" ../imagebuilder
+          cd ..
+          rm -rf extract_tmp
+
+          if [ ! -f "imagebuilder/Makefile" ]; then
+            echo "::error::ImageBuilder extraction failed"
+            exit 1
+          fi
+          echo "✅ ImageBuilder extracted successfully"
+
+      - name: 📝 Prepare Packages
+        id: packages
+        run: |
+          DEVICE="${{ env.DEVICE }}"
+          PACKAGES=""
+
+          # 全局包（当前为空，25.12 官方默认包已包含全部基础上网功能）
+          source "config/default_packages.sh"
+          # 设备级包（仅显式锁定官方精简主题 luci-theme-bootstrap）
+          source "build/${DEVICE}/packages.sh"
+
+          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
+          echo "::notice::Final PACKAGES: $PACKAGES"
+
+      - name: 📂 Copy Custom Files
+        run: |
+          DEVICE="${{ env.DEVICE }}"
+          DEVICE_CUSTOM_SH="build/${DEVICE}/99-custom.sh"
+          TARGET_CUSTOM_SH="imagebuilder/files/etc/uci-defaults/99-custom.sh"
+          HOSTNAME="${{ steps.device-config.outputs.hostname }}"
+          IP_ADDRESS="${{ steps.device-config.outputs.ip_address }}"
+          NETMASK="${{ steps.device-config.outputs.netmask }}"
+
+          if [ ! -f "$DEVICE_CUSTOM_SH" ]; then
+            echo "::error::Device custom script not found: $DEVICE_CUSTOM_SH"
+            exit 1
+          fi
+
+          mkdir -p imagebuilder/files/etc/uci-defaults
+          cp "$DEVICE_CUSTOM_SH" "$TARGET_CUSTOM_SH"
+          sed -i "s|^hostname=.*|hostname=\"${HOSTNAME}\"|" "$TARGET_CUSTOM_SH"
+          sed -i "s|^ip_address=.*|ip_address=\"${IP_ADDRESS}\"|" "$TARGET_CUSTOM_SH"
+          sed -i "s|^netmask=.*|netmask=\"${NETMASK}\"|" "$TARGET_CUSTOM_SH"
+          chmod +x "$TARGET_CUSTOM_SH"
+
+          echo "✅ Custom script patched: ${HOSTNAME} / ${IP_ADDRESS} / ${NETMASK}"
+
+      - name: 🔨 Build Firmware
+        run: |
+          PROFILE="${{ steps.device-config.outputs.profile }}"
+          PACKAGES="${{ steps.packages.outputs.packages }}"
+
+          cd imagebuilder
+          echo "🚀 PROFILE=$PROFILE"
+          echo "📦 PACKAGES=$PACKAGES"
+          echo "🔄 Jobs: $(nproc)"
+
+          if ! make -j$(nproc) image PROFILE="$PROFILE" PACKAGES="$PACKAGES" FILES="files/" V=s; then
+            echo "::error::Build failed"
+            [ -d logs ] && grep -i 'error\|failed' logs/*.log | head -20 || true
+            exit 1
+          fi
+          echo "✅ Build completed successfully"
+
+      - name: 🗜️ Archive Artifacts
+        run: |
+          PROFILE="${{ steps.device-config.outputs.profile }}"
+          ARTIFACT_DIR="artifacts/${PROFILE}"
+          ARCH_SEGMENT="${{ steps.device-config.outputs.sanitized_target }}-"
+
+          mkdir -p "$ARTIFACT_DIR"
+          mapfile -t FIRMWARE_FILES < <(find imagebuilder/bin/targets -type f \( \
+            -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" \
+            -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \))
+
+          if [ "${#FIRMWARE_FILES[@]}" -eq 0 ]; then
+            echo "::error::No firmware artifacts found under imagebuilder/bin/targets"
+            find imagebuilder/bin/targets -maxdepth 4 -type d -print || true
+            exit 1
+          fi
+
+          for file in "${FIRMWARE_FILES[@]}"; do
+            filename="$(basename "$file")"
+            cleaned_name="${filename#immortalwrt-}"
+            cleaned_name="${cleaned_name//${ARCH_SEGMENT}/}"
+            cp "$file" "$ARTIFACT_DIR/$cleaned_name"
+            echo "📦 $filename -> $cleaned_name"
+          done
+          echo "✅ Archived ${#FIRMWARE_FILES[@]} files"
+
+      - name: 🧹 Clean Firmware Before Cache
+        if: always()
+        run: |
+          if [ -d imagebuilder/bin ]; then
+            echo "🧹 Removing built firmware files before cache save..."
+            find imagebuilder/bin -type f \( \
+              -name "*.bin" -o -name "*.img" -o -name "*.itb" -o -name "*.fip" \
+              -o -name "*.gz" -o -name "*.trx" -o -name "*.manifest" -o -name "sha256sums" \) -exec rm -f {} +
+            echo "✅ Cleaned"
+          fi
+
+      - name: 🗑️ Delete Old Release & Tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_TAG="${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}"
+          echo "🔍 Checking for existing release: $RELEASE_TAG"
+
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            echo "🗑️ Deleting old release: $RELEASE_TAG"
+            gh release delete "$RELEASE_TAG" --repo "${{ github.repository }}" --yes
+          else
+            echo "ℹ️ No existing release found"
+          fi
+
+          if git rev-parse "$RELEASE_TAG" &>/dev/null; then
+            git tag -d "$RELEASE_TAG" || true
+            git push --delete origin "$RELEASE_TAG" 2>/dev/null || echo "⚠️ Remote tag not deleted (may not exist)"
+          fi
+
+      - name: 🚀 Upload to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: artifacts/${{ steps.device-config.outputs.profile }}/*
+          tag_name: ${{ steps.device-config.outputs.major_version }}-${{ steps.device-config.outputs.profile }}
+          name: 📤 ${{ steps.device-config.outputs.version }} ${{ steps.device-config.outputs.profile }}
+          body: |
+            ### 📋 Build Information
+
+            **Build ID**: `${{ github.run_id }}`
+            **Build Date**: `${{ steps.get-date.outputs.date }}`
+            **Source**: `immortalwrt/immortalwrt @ openwrt-25.12`
+
+            ### 🔧 Firmware Information
+
+            **Profile**: `${{ steps.device-config.outputs.profile }}`
+            **Architecture**: `${{ steps.device-config.outputs.arch }}`
+            **Target**: `${{ steps.device-config.outputs.targets }}`
+            **ImageBuilder Version**: `${{ steps.device-config.outputs.version }}`
+            **IP Address**: `${{ steps.device-config.outputs.ip_address }}`
+            **Packages**: `${{ steps.packages.outputs.packages }}`（官方默认包，无第三方插件）
+          draft: false
+          prerelease: false
