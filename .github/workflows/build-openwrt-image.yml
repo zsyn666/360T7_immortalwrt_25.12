@@ -1,11 +1,20 @@
 name: Build OpenWrt Image (qihoo_360t7)
 
 # 只构建 qihoo_360t7，基于 ImmortalWrt 25.12.2 官方 ImageBuilder。
+# 支持两种 flash 布局：ubi（qihoo_360t7-ubi，供已改 UBI 布局的设备）/ non-ubi（原厂布局）。
 # 不编译任何第三方插件：25.12 起包格式为 .apk，旧 ipk 插件链已全部移除。
 
 on:
   workflow_dispatch:
     inputs:
+      layout:
+        type: choice
+        description: "Flash 布局（360T7 刷过第三方 UBI U-Boot 的选 UBI）"
+        required: true
+        default: ubi
+        options:
+          - ubi
+          - non-ubi
       ip_address:
         type: string
         description: "后台 IP 地址（可选，默认 192.168.10.1）"
@@ -46,7 +55,16 @@ jobs:
         id: device-config
         run: |
           DEVICE="${{ env.DEVICE }}"
-          CONFIG_FILE="build/${DEVICE}/config.sh"
+          # 定时触发没有 inputs，默认走 UBI 布局（当前设备所用布局）
+          LAYOUT="${{ github.event.inputs.layout || 'ubi' }}"
+          case "$LAYOUT" in
+            ubi)      CONFIG_FILE="build/${DEVICE}/config_ubi.sh" ;;
+            non-ubi)  CONFIG_FILE="build/${DEVICE}/config.sh" ;;
+            *) echo "::error::Unknown layout: $LAYOUT"; exit 1 ;;
+          esac
+
+          echo "layout=$LAYOUT" >> $GITHUB_OUTPUT
+          echo "::notice::Layout: $LAYOUT -> $CONFIG_FILE"
 
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "::error::Config file not found: $CONFIG_FILE"
@@ -275,6 +293,7 @@ jobs:
             ### 🔧 Firmware Information
 
             **Profile**: `${{ steps.device-config.outputs.profile }}`
+            **Layout**: `${{ steps.device-config.outputs.layout }}`
             **Architecture**: `${{ steps.device-config.outputs.arch }}`
             **Target**: `${{ steps.device-config.outputs.targets }}`
             **ImageBuilder Version**: `${{ steps.device-config.outputs.version }}`
